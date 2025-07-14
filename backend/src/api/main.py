@@ -69,8 +69,82 @@ class MoveResponseModel(BaseModel):
     result: GameResultModel = Field(..., description="Game result after the move")
 
 #######################################
-# API Endpoints for the Game Logic (Contract Only)
+# API Endpoints for the Game Logic with actual logic implementation
 #######################################
+
+from threading import Lock
+
+# In-memory game state (single game for simplicity)
+_game_state = {
+    "board": [[None for _ in range(3)] for _ in range(3)],  # 3x3 board
+    "current_player": "X",  # 'X' starts first
+    "result": {"status": "in_progress", "winner": None}
+}
+_game_lock = Lock()
+
+def _init_board():
+    """Create new empty 3x3 board"""
+    return [[None for _ in range(3)] for _ in range(3)]
+
+def _check_winner(board):
+    """Check for winner: returns 'X', 'O', or None"""
+    # Check rows and columns
+    for i in range(3):
+        # Row
+        if board[i][0] == board[i][1] == board[i][2] and board[i][0] is not None:
+            return board[i][0]
+        # Column
+        if board[0][i] == board[1][i] == board[2][i] and board[0][i] is not None:
+            return board[0][i]
+    # Diagonals
+    if board[0][0] == board[1][1] == board[2][2] and board[0][0] is not None:
+        return board[0][0]
+    if board[2][0] == board[1][1] == board[0][2] and board[2][0] is not None:
+        return board[2][0]
+    # No winner
+    return None
+
+def _is_draw(board):
+    """Check if all cells are filled and there is no winner"""
+    for row in board:
+        if None in row:
+            return False
+    return _check_winner(board) is None
+
+def _compute_result(board):
+    """Compute GameResultModel for given board"""
+    winner = _check_winner(board)
+    if winner is not None:
+        return GameResultModel(status="won", winner=winner)
+    elif _is_draw(board):
+        return GameResultModel(status="draw", winner=None)
+    else:
+        return GameResultModel(status="in_progress", winner=None)
+
+def _get_next_player(current_player):
+    return "O" if current_player == "X" else "X"
+
+def _reset_game():
+    """Resets in-memory board and state to initial values"""
+    _game_state["board"] = _init_board()
+    _game_state["current_player"] = "X"
+    _game_state["result"] = {"status": "in_progress", "winner": None}
+
+def _export_gamestate():
+    """Return GameStateModel based on current memory"""
+    return GameStateModel(
+        board=[row[:] for row in _game_state["board"]],
+        current_player=_game_state["current_player"],
+        result=GameResultModel(**_game_state["result"])
+    )
+
+def _export_moveresponse():
+    """Return MoveResponseModel based on current memory"""
+    return MoveResponseModel(
+        board=[row[:] for row in _game_state["board"]],
+        current_player=_game_state["current_player"],
+        result=GameResultModel(**_game_state["result"])
+    )
 
 # PUBLIC_INTERFACE
 @app.post(
@@ -87,8 +161,10 @@ def start_or_reset_game():
     Returns:
         GameStateModel: The initial or reset game state, board as empty, current player as 'X', status as 'in_progress'.
     """
-    raise NotImplementedError("Game logic not implemented. This is only the contract.")
-
+    with _game_lock:
+        _reset_game()
+        # Compose state for API response
+        return _export_gamestate()
 
 # PUBLIC_INTERFACE
 @app.post(
@@ -108,8 +184,35 @@ def make_move(move: MoveModel):
     Returns:
         MoveResponseModel: The updated game state after the move.
     """
-    raise NotImplementedError("Game logic not implemented. This is only the contract.")
+    with _game_lock:
+        # Check if the game is in progress
+        if _game_state["result"]["status"] != "in_progress":
+            # Cannot play if game is finished, respond with latest state
+            return _export_moveresponse()
 
+        # Validate it's the correct player's turn
+        if move.player != _game_state["current_player"]:
+            raise ValueError(f"It is not {move.player}'s turn.")
+
+        # Validate move: within bounds and cell empty
+        if not (0 <= move.row < 3 and 0 <= move.col < 3):
+            raise ValueError("Move is out of bounds.")
+        if _game_state["board"][move.row][move.col] is not None:
+            raise ValueError("Cell already taken.")
+
+        # Make the move
+        _game_state["board"][move.row][move.col] = move.player
+
+        # Recompute result: win, draw, or still playing
+        result_model = _compute_result(_game_state["board"])
+        _game_state["result"] = result_model.model_dump()
+
+        # Advance player if game still in progress, else leave winner's turn
+        if _game_state["result"]["status"] == "in_progress":
+            _game_state["current_player"] = _get_next_player(move.player)
+        # else: do not change player, game is over
+
+        return _export_moveresponse()
 
 # PUBLIC_INTERFACE
 @app.get(
@@ -126,8 +229,8 @@ def get_game_state():
     Returns:
         GameStateModel: The full state of the current game.
     """
-    raise NotImplementedError("Game logic not implemented. This is only the contract.")
-
+    with _game_lock:
+        return _export_gamestate()
 
 @app.get("/")
 def health_check():
